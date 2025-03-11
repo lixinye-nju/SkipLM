@@ -1,0 +1,6 @@
+[submodule "LLaMA-Factory"]
+	path = LLaMA-Factory
+	url = https://github.com/hiyouga/LLaMA-Factory
+[submodule "CodeEditorBench"]
+	path = CodeEditorBench
+	url = https://github.com/lixinye-nju/CodeEditorBench
