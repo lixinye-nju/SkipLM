@@ -23,7 +23,7 @@ from tqdm import tqdm
 
 # Set up logging
 logger = logging.getLogger(__name__)
-logger.setLevel(level=logging.ERROR)
+logger.setLevel(level=logging.INFO)
 
 
 # Type variables for generic task and result
@@ -157,6 +157,9 @@ class ResultsManager:
     def result_processor(self, input_queue: MPQueue):
         """Process that receives results from the queue and manages processing."""
         try:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    
             while not self.should_stop.is_set():
                 try:
                     # Try to get a result with timeout
@@ -282,7 +285,9 @@ class TaskWorker:
         """Main worker loop that processes tasks from the queue."""
         try:
             self.initialize()
-            
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    
             while not self.stop_event.is_set():
                 try:
                     # Try to get a task with timeout
@@ -351,6 +356,11 @@ class TaskWorker:
             logger.info(f"Worker {self.worker_id} shutting down")
 
 
+class CleanupException(Exception):
+    """Raised when cleanup has been performed."""
+    pass
+
+
 class TaskProcessingEngine:
     """A reusable engine for parallel task processing using producer-consumer pattern."""
     
@@ -390,7 +400,7 @@ class TaskProcessingEngine:
         self.result_process = None
         self.manager = None
         
-        # Register signal handlers for clean shutdown
+        # Register signal handlers for clean shutdown - ONLY in the main process
         self._original_sigint_handler = signal.getsignal(signal.SIGINT)
         self._original_sigterm_handler = signal.getsignal(signal.SIGTERM)
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -409,6 +419,9 @@ class TaskProcessingEngine:
         signal.signal(signal.SIGINT, self._original_sigint_handler)
         signal.signal(signal.SIGTERM, self._original_sigterm_handler)
         
+        raise CleanupException(f"Cleanup performed due to signal {sig}")
+
+        
     def _setup(self, total_tasks: int):
         """Set up queues, workers, and result manager."""
         # Create a manager for sharing objects between processes
@@ -426,7 +439,7 @@ class TaskProcessingEngine:
         self.result_process = Process(
             target=self.results_manager.result_processor,
             args=(self.result_queue,),
-            daemon=True  # Make it a daemon so it exits when main process exits
+            daemon=True,  # Make it a daemon so it exits when main process exits
         )
         self.result_process.start()
         
@@ -443,30 +456,30 @@ class TaskProcessingEngine:
                 stop_event=self.stop_event
             )
             
-            p = Process(target=worker.run, daemon=True)  # Make it a daemon
+            p = Process(target=worker.run, 
+                        daemon=True)  # Make it a daemon
             p.start()
             self.workers.append(p)
             
         logger.info(f"Started {len(self.workers)} worker processes")
     
+
     def _cleanup(self):
         """Clean up resources and stop workers."""
+        # # Only perform cleanup once
+        # if hasattr(self, '_cleanup_done') and self._cleanup_done:
+        #     return
+        
         logger.info("Cleaning up resources...")
+        
+        # Mark cleanup as in progress to prevent multiple cleanup attempts
+        # self._cleanup_done = True
         
         # Signal stop to all components
         self.stop_event.set()
         
         try:
-
-            # Stop the results manager
-            if self.results_manager:
-                try:
-                    self.results_manager.stop()
-                except Exception as e:
-                    logger.error(f"Error stopping results manager: {e}")
-                
-            # First try to gracefully stop all processes
-            # Put sentinel values in task queue
+            # STEP 1: Signal workers to finish by sending sentinel values to task queue
             if self.task_queue:
                 try:
                     # Add sentinel values without blocking
@@ -475,11 +488,13 @@ class TaskProcessingEngine:
                             self.task_queue.put(None, block=False)
                         except queue.Full:
                             pass
+                        except Exception as e:
+                            logger.error(f"Error putting sentinel in task queue: {e}")
                 except Exception as e:
-                    logger.error(f"Error sending sentinel values: {e}")
+                    logger.error(f"Error accessing task queue for sentinels: {e}")
             
-            # Give processes a short time to exit gracefully
-            timeout = 2  # seconds
+            # STEP 2: Give workers a short time to exit gracefully
+            timeout = 5  # seconds
             start_time = time.time()
             
             # Wait for workers with timeout
@@ -488,7 +503,7 @@ class TaskProcessingEngine:
                 time.sleep(0.1)
                 running_workers = [w for w in self.workers if w.is_alive()]
             
-            # Terminate any remaining workers
+            # STEP 3: Terminate any workers that didn't exit gracefully
             for i, w in enumerate(self.workers):
                 if w.is_alive():
                     logger.info(f"Terminating worker {i}...")
@@ -497,14 +512,14 @@ class TaskProcessingEngine:
                     except Exception as e:
                         logger.error(f"Error terminating worker {i}: {e}")
             
-            # Put sentinel in result queue
+            # STEP 4: Signal result processor to finish by sending sentinel
             if self.result_queue:
                 try:
                     self.result_queue.put(None, block=False)
                 except Exception as e:
                     logger.error(f"Error sending sentinel to result queue: {e}")
             
-            # Wait for result processor with short timeout
+            # STEP 5: Wait for result processor with short timeout
             if self.result_process and self.result_process.is_alive():
                 self.result_process.join(timeout=1)
                 
@@ -515,7 +530,14 @@ class TaskProcessingEngine:
                     except Exception as e:
                         logger.error(f"Error terminating result processor: {e}")
             
-            # Close queues
+            # STEP 6: Stop the results manager (which handles the progress bar)
+            if self.results_manager:
+                try:
+                    self.results_manager.stop()
+                except Exception as e:
+                    logger.error(f"Error stopping results manager: {e}")
+            
+            # STEP 7: Close queues
             if self.task_queue:
                 try:
                     self.task_queue.close()
@@ -528,7 +550,7 @@ class TaskProcessingEngine:
                 except Exception as e:
                     logger.error(f"Error closing result queue: {e}")
             
-            # Shutdown the manager
+            # STEP 8: Shutdown the manager
             if self.manager:
                 try:
                     self.manager.shutdown()
@@ -557,7 +579,7 @@ class TaskProcessingEngine:
         
         logger.info("Cleanup complete.")
         return
-        
+   
     def process_tasks(self, tasks: List[T]) -> Dict[str, Any]:
         """
         Process a list of tasks using multiple workers.
@@ -568,9 +590,7 @@ class TaskProcessingEngine:
         Returns:
             Dictionary with statistics about the processing
         """
-        if not tasks:
-            return {"total": 0, "passed": 0, "pass_rate": 0.0}
-            
+
         total_tasks = len(tasks)
         
         try:
@@ -579,35 +599,29 @@ class TaskProcessingEngine:
             
             # Enqueue tasks with progress reporting
             logger.info(f"Enqueueing {total_tasks} tasks...")
-            task_enqueue_progress = tqdm(
-                total=total_tasks, 
-                desc="Filling task queue", 
-                position=1
-            )
-            
+
             # Queue all tasks
-            try:
-                for task in tasks:
-                    # Check if we should stop
-                    if self.stop_event.is_set():
+
+            for task in tasks:
+                # Check if we should stop
+                if self.stop_event.is_set():
+                    logger.info("Stop event detected during task enqueuing, exiting early")
+                    break
+                    
+                # Try to put task in queue, with periodic checks for interruption
+                while not self.stop_event.is_set():
+                    try:
+                        self.task_queue.put(task, timeout=0.5)
+                        # task_enqueue_progress.update(1)
                         break
-                        
-                    # Try to put task in queue, with periodic checks for interruption
-                    while not self.stop_event.is_set():
-                        try:
-                            self.task_queue.put(task, timeout=0.5)
-                            task_enqueue_progress.update(1)
-                            break
-                        except queue.Full:
-                            # Queue is full, wait a bit
-                            time.sleep(0.1)
-                        except (EOFError, BrokenPipeError, ConnectionError):
-                            logger.error("Task queue connection lost.")
-                            self.stop_event.set()
-                            break
-            finally:
-                task_enqueue_progress.close()
-                
+                    except queue.Full:
+                        # Queue is full, wait a bit
+                        time.sleep(0.1)
+                    except (EOFError, BrokenPipeError, ConnectionError):
+                        logger.error("Task queue connection lost.")
+                        self.stop_event.set()
+                        break
+            
             if not self.stop_event.is_set():
                 logger.info("All tasks enqueued")
                 
@@ -653,18 +667,20 @@ class TaskProcessingEngine:
                     logger.warning("Result processor didn't terminate in time, will be handled in cleanup.")
                 else:
                     logger.info("Result processor completed successfully.")
-                    
-        except KeyboardInterrupt:
-            logger.info("\nInterrupted by user. Cleaning up...")
+
+        except CleanupException as e:
+            logger.info(str(e))
         except Exception as e:
             logger.error(f"Error during processing: {e}")
         finally:
-            # Restore original signal handlers before cleanup
-            signal.signal(signal.SIGINT, self._original_sigint_handler)
-            signal.signal(signal.SIGTERM, self._original_sigterm_handler)
-            
-            # Clean up
-            self._cleanup()
+            # Only call cleanup if the stop event hasn't been set
+            # (if it was set, cleanup was already called by the signal handler)
+            if not self.stop_event.is_set():
+                # Restore original signal handlers before cleanup
+                signal.signal(signal.SIGINT, self._original_sigint_handler)
+                signal.signal(signal.SIGTERM, self._original_sigterm_handler)
+                # Clean up
+                self._cleanup()
             
             return
 
@@ -674,10 +690,9 @@ if __name__ == "__main__":
     # Set up basic logging configuration
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        format='%(asctime)s - %(name)s - %(levelname)s - [%(process)d] - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
-    
     
     # This is a simple example that demonstrates the task processing framework
     
@@ -708,7 +723,7 @@ if __name__ == "__main__":
         processor_args={"model_path": "path/to/model"},
         process_func=process_task,
         result_handler=handle_results,
-        num_workers=4,
+        num_workers=2,
         task_queue_size=50  # Small queue size for this example
     )
     
