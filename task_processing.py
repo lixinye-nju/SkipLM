@@ -158,7 +158,6 @@ class ResultsManager:
         """Process that receives results from the queue and manages processing."""
         try:
             signal.signal(signal.SIGINT, signal.SIG_IGN)
-            signal.signal(signal.SIGTERM, signal.SIG_IGN)
     
             while not self.should_stop.is_set():
                 try:
@@ -286,7 +285,6 @@ class TaskWorker:
         try:
             self.initialize()
             signal.signal(signal.SIGINT, signal.SIG_IGN)
-            signal.signal(signal.SIGTERM, signal.SIG_IGN)
     
             while not self.stop_event.is_set():
                 try:
@@ -371,7 +369,7 @@ class TaskProcessingEngine:
         process_func: Callable[[Any, T], R],
         result_handler: Callable[[List[R]], None],
         num_workers: Optional[int] = None,
-        task_queue_size: int = 10000
+        task_queue_size: int = 256
     ):
         """
         Initialize the task processing engine.
@@ -402,9 +400,7 @@ class TaskProcessingEngine:
         
         # Register signal handlers for clean shutdown - ONLY in the main process
         self._original_sigint_handler = signal.getsignal(signal.SIGINT)
-        self._original_sigterm_handler = signal.getsignal(signal.SIGTERM)
         signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
         
     def _signal_handler(self, sig, frame):
         """Handle termination signals for clean shutdown."""
@@ -417,7 +413,6 @@ class TaskProcessingEngine:
             
         # Restore original signal handlers and re-raise the signal
         signal.signal(signal.SIGINT, self._original_sigint_handler)
-        signal.signal(signal.SIGTERM, self._original_sigterm_handler)
         
         raise CleanupException(f"Cleanup performed due to signal {sig}")
 
@@ -537,16 +532,28 @@ class TaskProcessingEngine:
                 except Exception as e:
                     logger.error(f"Error stopping results manager: {e}")
             
+            logger.info("Closing task_queue.")
             # STEP 7: Close queues
             if self.task_queue:
                 try:
-                    self.task_queue.close()
+                    if self.task_queue.empty():
+                        self.task_queue.close()
+                        self.task_queue.join_thread()
+                    else:
+                        self.task_queue.cancel_join_thread()
+                        self.task_queue.close()
                 except Exception as e:
                     logger.error(f"Error closing task queue: {e}")
                     
+            logger.info("Closing result_queue.")
             if self.result_queue:
                 try:
-                    self.result_queue.close()
+                    if self.result_queue.empty():
+                        self.result_queue.close()
+                        self.result_queue.join_thread()
+                    else:
+                        self.result_queue.cancel_join_thread()
+                        self.result_queue.close()
                 except Exception as e:
                     logger.error(f"Error closing result queue: {e}")
             
@@ -637,7 +644,7 @@ class TaskProcessingEngine:
                         break
                 
                 # Wait for all workers to finish
-                worker_timeout = 30  # 30 seconds timeout
+                worker_timeout = 30 * self.task_queue_size  # 30 seconds timeout
                 start_time = time.time()
                 active_workers = len([w for w in self.workers if w.is_alive()])
                 
@@ -678,7 +685,6 @@ class TaskProcessingEngine:
             if not self.stop_event.is_set():
                 # Restore original signal handlers before cleanup
                 signal.signal(signal.SIGINT, self._original_sigint_handler)
-                signal.signal(signal.SIGTERM, self._original_sigterm_handler)
                 # Clean up
                 self._cleanup()
             
