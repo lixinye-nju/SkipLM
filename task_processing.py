@@ -23,7 +23,7 @@ from tqdm import tqdm
 
 # Set up logging
 logger = logging.getLogger(__name__)
-logger.setLevel(level=logging.INFO)
+logger.setLevel(level=logging.ERROR)
 
 
 # Type variables for generic task and result
@@ -31,7 +31,7 @@ T = TypeVar('T')  # Task type
 R = TypeVar('R')  # Result type
 
 # Constants
-DEFAULT_TIMEOUT = 300  # 5 minutes timeout for operations
+DEFAULT_TIMEOUT = 3600  # 60 minutes timeout for operations
 MAX_RETRY_ATTEMPTS = 3  # Max retries for failed operations
 
 
@@ -94,14 +94,12 @@ class ResultsManager:
                 self.progress_bar.update(increment)
             
     
-    def add_result(self, result: Union[R, List[R]], success: Optional[bool] = None):
+    def add_result(self, result: Union[R, List[R]]):
         """
         Add a result or list of results to the buffer.
         
         Args:
             result: Single result or list of results
-            success: Whether the result represents a success (True) or failure (False)
-                     If None, doesn't update the pass counter
         """
         if result is None:
             return
@@ -172,17 +170,12 @@ class ResultsManager:
                         logger.info("Result processor received sentinel. Finishing up.")
                         break
                         
-                    # Unpack the result and success flag if provided as tuple
-                    if isinstance(result, tuple) and len(result) == 2:
-                        result_data, success = result
-                    else:
-                        result_data, success = result, None
-                        
-                    self.add_result(result_data, success)
+                    logger.info("Result processor add result(s) to buffer.")
+                    self.add_result(result)
                     
                 except queue.Empty:
                     # No data in queue, check if we should flush buffer
-                    self._flush_buffer()
+                    pass
                 except Exception as e:
                     logger.error(f"Error in result processor: {e}")
                     if "Broken pipe" in str(e) or "Connection reset" in str(e):
@@ -190,6 +183,7 @@ class ResultsManager:
                         break
                     
             # Final flush before exiting
+            logger.info("Result process final flush before exiting.")
             self._flush_buffer()
             logger.info("Result processor completed")
             
@@ -474,31 +468,15 @@ class TaskProcessingEngine:
         self.stop_event.set()
         
         try:
-            # STEP 1: Signal workers to finish by sending sentinel values to task queue
-            if self.task_queue:
+
+            # STEP 2: Signal result processor to finish by sending sentinel
+            if self.result_queue:
                 try:
-                    # Add sentinel values without blocking
-                    for _ in range(len(self.workers)):
-                        try:
-                            self.task_queue.put(None, block=False)
-                        except queue.Full:
-                            pass
-                        except Exception as e:
-                            logger.error(f"Error putting sentinel in task queue: {e}")
+                    self.result_queue.put(None, block=False)
                 except Exception as e:
-                    logger.error(f"Error accessing task queue for sentinels: {e}")
+                    logger.error(f"Error sending sentinel to result queue: {e}")
             
-            # STEP 2: Give workers a short time to exit gracefully
-            timeout = 5  # seconds
-            start_time = time.time()
-            
-            # Wait for workers with timeout
-            running_workers = [w for w in self.workers if w.is_alive()]
-            while running_workers and time.time() - start_time < timeout:
-                time.sleep(0.1)
-                running_workers = [w for w in self.workers if w.is_alive()]
-            
-            # STEP 3: Terminate any workers that didn't exit gracefully
+            # STEP 4: Terminate any workers that didn't exit gracefully
             for i, w in enumerate(self.workers):
                 if w.is_alive():
                     logger.info(f"Terminating worker {i}...")
@@ -506,17 +484,10 @@ class TaskProcessingEngine:
                         w.terminate()
                     except Exception as e:
                         logger.error(f"Error terminating worker {i}: {e}")
-            
-            # STEP 4: Signal result processor to finish by sending sentinel
-            if self.result_queue:
-                try:
-                    self.result_queue.put(None, block=False)
-                except Exception as e:
-                    logger.error(f"Error sending sentinel to result queue: {e}")
-            
+
             # STEP 5: Wait for result processor with short timeout
             if self.result_process and self.result_process.is_alive():
-                self.result_process.join(timeout=1)
+                self.result_process.join(timeout=5)
                 
                 if self.result_process.is_alive():
                     logger.info("Terminating result processor...")
@@ -524,7 +495,7 @@ class TaskProcessingEngine:
                         self.result_process.terminate()
                     except Exception as e:
                         logger.error(f"Error terminating result processor: {e}")
-            
+
             # STEP 6: Stop the results manager (which handles the progress bar)
             if self.results_manager:
                 try:
@@ -532,6 +503,7 @@ class TaskProcessingEngine:
                 except Exception as e:
                     logger.error(f"Error stopping results manager: {e}")
             
+
             logger.info("Closing task_queue.")
             # STEP 7: Close queues
             if self.task_queue:
@@ -644,7 +616,7 @@ class TaskProcessingEngine:
                         break
                 
                 # Wait for all workers to finish
-                worker_timeout = 30 * self.task_queue_size  # 30 seconds timeout
+                worker_timeout = 300 * self.task_queue_size  # 30 seconds timeout
                 start_time = time.time()
                 active_workers = len([w for w in self.workers if w.is_alive()])
                 
@@ -657,24 +629,6 @@ class TaskProcessingEngine:
                 else:
                     logger.info("All workers finished successfully.")
                     
-                logger.info("Sending sentinel to result processor.")
-                    
-                # Signal result processor to finish
-                try:
-                    self.result_queue.put(None, timeout=0.5)
-                except (queue.Full, EOFError, BrokenPipeError):
-                    logger.error("Could not send sentinel to result processor.")
-                
-                # Wait for result processor with timeout
-                result_timeout = 5  # 5 seconds timeout
-                if self.result_process:
-                    self.result_process.join(timeout=result_timeout)
-                
-                if self.result_process and self.result_process.is_alive():
-                    logger.warning("Result processor didn't terminate in time, will be handled in cleanup.")
-                else:
-                    logger.info("Result processor completed successfully.")
-
         except CleanupException as e:
             logger.info(str(e))
         except Exception as e:

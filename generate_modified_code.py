@@ -156,8 +156,14 @@ def process_single_example(example: Dict[str, Any],
 
     except Exception as e:
         logging.warning(f"{type(e)}: {e}\nCause:\n{text}")
-        return None
-    
+        # return None to skip this generation
+        # return failed result if keep
+        return {
+            "task_id": example["task_id"],
+            "instruction": "",
+            "code": code,
+            "modified_code": modified_code
+        }
 
 
 
@@ -165,7 +171,7 @@ if __name__ == "__main__":
     # Set up basic logging configuration
     logging.basicConfig(
         level=logging.WARNING,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        format='%(asctime)s - %(name)s - %(levelname)s - [%(process)d] - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     
@@ -236,3 +242,4 @@ if __name__ == "__main__":
     engine.process_tasks(all_tasks)
     
     logging.info(f"Processing completed")
+
