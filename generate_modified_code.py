@@ -162,7 +162,7 @@ def process_single_example(example: Dict[str, Any],
             "task_id": example["task_id"],
             "instruction": "",
             "code": code,
-            "modified_code": modified_code
+            "modified_code": ""
         }
 
 
