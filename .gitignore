@@ -1,0 +1,12 @@
+# dataset
+data
+
+# outputs
+outputs
+
+
+# Ignore all hidden files and directories
+.*
+
+# But keep these hidden files
+!.gitignore
