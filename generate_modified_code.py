@@ -95,7 +95,7 @@ def get_sampling_params(args):
         return dict(
             n=args.num_of_sequences, 
             temperature=0.0, 
-            max_tokens=4096,
+            max_tokens=8192,
             frequency_penalty=args.frequency_penalty, 
             presence_penalty=args.presence_penalty,
         )
@@ -104,7 +104,7 @@ def get_sampling_params(args):
             n=args.num_of_sequences, 
             temperature=0.4, 
             top_p=0.95, 
-            max_tokens=4096,
+            max_tokens=8192,
             frequency_penalty=args.frequency_penalty, 
             presence_penalty=args.presence_penalty,
         )
