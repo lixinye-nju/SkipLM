@@ -22,6 +22,7 @@ def parse_args():
     parser.add_argument("--base_url", type=str, required=True, help="IP address for openai-compatible server.")
     parser.add_argument("--json_path", type=str, required=True, help="Input json file.")
     parser.add_argument("--output_path", type=str, required=True, help="Output file")
+    parser.add_argument("--use-cot_prompt", type=str, default=False, help="Whether to use CoT prompt.")
     parser.add_argument("--num_proc", type=int, default=128, help="Maximum number of processes for processing")
     parser.add_argument("--max_model_len", type=int, default=8192, help="Maximum length for LLM.")
     return parser.parse_args()
@@ -63,6 +64,7 @@ def process_single_example(example: Dict[str, str],
                            client: openai.Client,
                            model_name_or_path: str,
                            sampling_params: Dict[str, Any],
+                           use_cot_prompt: bool = False,
                            mininum_lines: int = 8,
                            diff_frac_threshold: float=0.2):
     task_id = example["task_id"]
@@ -130,19 +132,40 @@ def process_single_example(example: Dict[str, str],
 {new_code}
 
 Your task is to judge if the code modification is aligned with the instruction.
+1. ANSWER `YES` or `NO`
+2. DO NOT include other content.
+"""
+    
+    COT_PROMPT_FORMPT = r"""### Instruction
+{instruction}
+
+### OLD CODE
+```
+{old_code}
+```
+
+### NEW CODE
+```
+{new_code}
+
+Your task is to judge if the code modification is aligned with the instruction.
 
 Let think step by step and answer `YES` or `NO` in the end.
 
 ### FORMAT
 Thoughts: write your thoughts Here.
-
 ANSWER: YES / NO
 """
 
+    if use_cot_prompt:
+        query = COT_PROMPT_FORMPT.format(instruction=example["instruction"],
+                                         old_code=example["code"],
+                                         new_code=example["modified_code"])
+    else:
+        query = PROMPT_FORMPT.format(instruction=example["instruction"],
+                                     old_code=example["code"],
+                                     new_code=example["modified_code"])
 
-    query = PROMPT_FORMPT.format(instruction=example["instruction"],
-                                 old_code=example["code"],
-                                 new_code=example["modified_code"])
     messages = [{"role": "user", "content": query}]
     response = client.chat.completions.create(
         messages=messages,
@@ -152,7 +175,12 @@ ANSWER: YES / NO
     
     text = response.choices[0].message.content # type: str
     text = text.lower()
-    if re.search(r"answer\s*[:]\s*(no|n)\b", text):
+    
+    if use_cot_prompt:
+        cond = re.search(r"answer\s*[:]\s*(no|n)\b", text)
+    else:
+        cond = re.search(r"no", text)
+    if cond:
         return {
             **example,
             "high_quality": False,
@@ -218,7 +246,7 @@ if __name__ == "__main__":
         return {"worker_id": worker_id}
     
     def process_task(processor, task):
-        return process_single_example(task, client, model_name_or_path, sampling_params)
+        return process_single_example(task, client, model_name_or_path, sampling_params, use_cot_prompt=args.use_cot_prompt)
     
     def handle_results(results):
         write_jsonl(args.output_path, results, append=True)
